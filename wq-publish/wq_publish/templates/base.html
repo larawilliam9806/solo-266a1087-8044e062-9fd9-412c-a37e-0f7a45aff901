@@ -11,6 +11,9 @@
            color:#1d2939; background:#f4f6f9; line-height:1.55; }
     header { background:#10325f; color:#fff; padding:14px 28px; }
     header h1 { margin:0; font-size:19px; font-weight:600; }
+    header nav { margin-top:7px; font-size:14px; }
+    header nav a { color:#bfd4ef; text-decoration:none; margin-right:18px; }
+    header nav a:hover { color:#fff; text-decoration:underline; }
     main { max-width:1080px; margin:24px auto; padding:0 20px; }
     .card { background:#fff; border:1px solid var(--line); border-radius:10px;
             padding:20px 24px; margin-bottom:20px; }
@@ -49,7 +52,13 @@
   </style>
 </head>
 <body>
-  <header><h1>水质实验室 · 批次修订发布台</h1></header>
+  <header>
+    <h1>水质实验室 · 批次修订发布台</h1>
+    <nav>
+      <a href="{{ url_for('index') }}">批次发布</a>
+      <a href="{{ url_for('trend') }}">质控趋势</a>
+    </nav>
+  </header>
   <main>
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, message in messages %}

@@ -1,6 +1,7 @@
-"""Flask 路由：上传校验 → 预览增删改 → 确认整批替换。"""
+"""Flask 路由：上传校验 → 预览增删改 → 确认整批替换；质控趋势查询。"""
 from __future__ import annotations
 
+import math
 import os
 import secrets
 import sqlite3
@@ -20,6 +21,22 @@ from .storage import LIVE_FILENAME, PublishConflictError, Storage
 from .validation import format_concentration, validate_csv
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+
+
+def _finite_param(text: str, label: str, errors: list[str]):
+    """解析有限浮点参数；非法时追加中文错误说明并返回 None。"""
+    if not text:
+        errors.append(f"{label}不能为空")
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        errors.append(f"{label}“{text}”不是合法数字")
+        return None
+    if math.isnan(value) or math.isinf(value):
+        errors.append(f"{label}必须是有限数，不能为 NaN 或无穷大")
+        return None
+    return value
 
 
 def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -> Flask:
@@ -170,6 +187,57 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
         return send_file(
             storage.live_path, mimetype="text/csv",
             download_name=LIVE_FILENAME, as_attachment=False,
+        )
+
+    @app.get("/trend")
+    def trend():
+        """质控趋势页：连续偏高/偏低告警，每次访问基于同一已提交快照实时重算。"""
+        form = {
+            "sample_no": request.args.get("sample_no", "").strip(),
+            "analyte": request.args.get("analyte", "").strip(),
+            "target": request.args.get("target", "").strip(),
+            "stddev": request.args.get("stddev", "").strip(),
+        }
+        submitted = any(
+            k in request.args for k in ("sample_no", "analyte", "target", "stddev")
+        )
+        errors: list[str] = []
+        target = stddev = None
+        if submitted:
+            if not form["sample_no"]:
+                errors.append("质控样本号不能为空")
+            if not form["analyte"]:
+                errors.append("检测项目不能为空")
+            target = _finite_param(form["target"], "目标浓度", errors)
+            if target is not None and target < 0:
+                errors.append("目标浓度必须是非负有限数（≥ 0）")
+                target = None
+            stddev = _finite_param(form["stddev"], "标准差", errors)
+            if stddev is not None and stddev <= 0:
+                errors.append("标准差必须是正有限数（> 0）")
+                stddev = None
+
+        result = None
+        read_error = None
+        if submitted and not errors:
+            try:
+                result = storage.qc_trend(
+                    form["sample_no"], form["analyte"], target, stddev
+                )
+            except (sqlite3.Error, OSError) as exc:
+                # 读取失败：只提示错误，绝不渲染可能过期的旧告警
+                app.logger.warning("trend read failed: %s", exc)
+                read_error = (
+                    "趋势数据读取失败，本次不显示任何趋势与告警"
+                    "（避免展示过期判断），请稍后重试"
+                )
+        return render_template(
+            "trend.html",
+            form=form,
+            submitted=submitted,
+            errors=errors,
+            result=result,
+            read_error=read_error,
         )
 
     @app.errorhandler(413)

@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}质控趋势 · 水质批次修订发布{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>质控趋势查询</h2>
+  <form method="get" action="{{ url_for('trend') }}">
+    <div class="grid2">
+      <div>
+        <label for="sample_no">质控样本号</label>
+        <input type="text" id="sample_no" name="sample_no" maxlength="64" required
+               value="{{ form.sample_no }}" placeholder="例如 QC-001">
+      </div>
+      <div>
+        <label for="analyte">检测项目</label>
+        <input type="text" id="analyte" name="analyte" maxlength="64" required
+               value="{{ form.analyte }}" placeholder="例如 氨氮">
+      </div>
+      <div>
+        <label for="target">目标浓度（mg/L，非负有限数）</label>
+        <input type="text" id="target" name="target" required
+               value="{{ form.target }}" placeholder="例如 1.0">
+      </div>
+      <div>
+        <label for="stddev">标准差（mg/L，正有限数）</label>
+        <input type="text" id="stddev" name="stddev" required
+               value="{{ form.stddev }}" placeholder="例如 0.05">
+      </div>
+    </div>
+    <p class="muted">
+      判定规则：批次按<strong>首次发布顺序</strong>排列，每批取<strong>最后一次已发布版本</strong>的
+      对应读数（同批修订只计一次）；该批缺此样本/项目读数时连续段中断。相邻两批读数均
+      <strong>严格高于 目标+2σ</strong> 判为连续偏高，均<strong>严格低于 目标−2σ</strong>
+      判为连续偏低，标出后一批及两批的依据版本。每次查询都基于同一时刻完整的已提交
+      版本视图实时重算：旧批次重发或修改参数后，告警随之更新。
+    </p>
+    <button type="submit">查询趋势</button>
+  </form>
+</div>
+
+{% if errors %}
+<div class="card">
+  <h2>查询参数有误</h2>
+  {% for e in errors %}
+  <div class="flash error">{{ e }}</div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if read_error %}
+<div class="card">
+  <div class="flash error" style="margin-bottom:0">{{ read_error }}</div>
+</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>控制限与告警</h2>
+  <div class="meta">
+    <div><b>质控样本 / 项目</b><span>{{ result.sample_no }} · {{ result.analyte }}</span></div>
+    <div><b>目标浓度</b><span>{{ result.target|conc }}</span></div>
+    <div><b>控制上限（目标+2σ）</b><span>{{ result.upper|conc }}</span></div>
+    <div><b>控制下限（目标−2σ）</b><span>{{ result.lower|conc }}</span></div>
+    <div><b>批次数</b><span>{{ result.points|length }}</span></div>
+  </div>
+  {% if result.alerts %}
+  <table>
+    <thead>
+      <tr>
+        <th>告警类型</th><th>标出批次（后一批）</th><th>依据版本</th>
+        <th>前一批</th><th>依据版本</th><th>两批读数（前 → 后）</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for a in result.alerts %}
+      <tr>
+        <td>
+          {% if a.direction == 'high' %}<span class="tag del">连续偏高</span>
+          {% else %}<span class="tag upd">连续偏低</span>{% endif %}
+        </td>
+        <td><strong>{{ a.later.batch_no }}</strong></td>
+        <td>v{{ a.later.last_version }}</td>
+        <td>{{ a.earlier.batch_no }}</td>
+        <td>v{{ a.earlier.last_version }}</td>
+        <td>{{ a.earlier.value|conc }} → {{ a.later.value|conc }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted" style="margin-bottom:0">当前参数下无连续偏高/偏低告警。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>批次序列（首次发布顺序，每批取末次已发布版本读数）</h2>
+  {% if result.points %}
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>批次号</th><th>首次发布版本</th><th>依据版本（末次）</th>
+          <th>读数 (mg/L)</th><th>状态</th><th>告警标记</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for p in result.points %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td>{{ p.batch_no }}</td>
+          <td>v{{ p.first_version }}</td>
+          <td>v{{ p.last_version }}</td>
+          <td>
+            {% if p.value is none %}<span class="muted">缺项</span>
+            {% else %}{{ p.value|conc }}{% endif %}
+          </td>
+          <td>
+            {% if p.status == 'high' %}<span class="tag del">高于上限</span>
+            {% elif p.status == 'low' %}<span class="tag upd">低于下限</span>
+            {% elif p.status == 'missing' %}<span class="tag same">缺项</span>
+            {% else %}<span class="tag ins">正常</span>{% endif %}
+          </td>
+          <td>{% if p.flagged %}<span class="tag del">告警批次</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted" style="margin-bottom:0">尚无已发布批次。</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

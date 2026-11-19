@@ -4,6 +4,10 @@
 CSV、填写批次号，系统逐行校验后预览**新增 / 修改 / 撤回（删除）**差异，确认后
 **整批替换**下游采集程序读取的本地 CSV，并在网页登记当前版本与行数。
 
+另设**质控趋势页**（`/trend`）：质控员填写质控样本号、检测项目、目标浓度与标准差，
+系统按批次首次发布顺序取每批末次已发布版本的读数，发现连续偏高/偏低的批次并
+标出告警，供复查仪器。
+
 ## 功能与规则
 
 - 上传 CSV 必须包含三列（表头兼容中英文）：`样本号`、`检测项目`、`浓度(mg/L)`
@@ -17,6 +21,20 @@ CSV、填写批次号，系统逐行校验后预览**新增 / 修改 / 撤回（
 - 预览页分类展示新增、修改（旧值→新值）、撤回、不变四类差异，确认后才发布。
 - 首页登记当前版本号、批次号、行数、发布时间（UTC）与内容 SHA256，并提供
   已发布 CSV 的在线查看入口和事件日志（含每次恢复记录）。
+
+## 质控趋势页（/trend）
+
+- 查询参数：质控样本号、检测项目（均不能为空）、目标浓度（**非负有限数**）、
+  标准差（**正有限数**）；参数非法时页面逐条提示，不显示任何结果。
+- 判定规则：
+  - 批次按**首次发布顺序**排列，每批取**最后一次已发布版本**中该样本/项目的
+    读数——同批修订只计一次，旧批次重发后读数与告警随之重算；
+  - 某批缺该样本/项目读数时**连续段中断**，跨缺项的批次对不产生告警；
+  - 相邻两批读数均**严格高于 目标+2σ** 判为连续偏高，均**严格低于 目标−2σ**
+    判为连续偏低；告警标出**后一批**，并列出两批各自的依据版本号。
+- 一致性：每次查询在**同一个读事务**内完成，整页结果基于同一份完整的已提交
+  版本快照；并发发布不会混入半个新版本，发布失败（事务回滚）不改变判断。
+  趋势不缓存：每次访问实时重算；读取失败时页面只提示错误，**不显示旧告警**。
 
 ## 本地启动
 
@@ -45,6 +63,21 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 | `WQ_DOWNSTREAM_DIR` | `./downstream` | 下游采集程序读取目录，正式文件固定名为 `published_results.csv` |
 
 下游采集程序只需固定读取 `WQ_DOWNSTREAM_DIR/published_results.csv`。
+
+## Docker Compose 启动
+
+仓库根目录提供 `Dockerfile` 与 `docker-compose.yml`：
+
+```bash
+cd wq-publish
+docker compose up -d --build     # 访问 http://127.0.0.1:5000 ，趋势页在 /trend
+```
+
+- 容器内以 `waitress` 运行（单进程多线程），监听 5000 端口；
+- 命名卷 `wq-data`（SQLite 登记库、密钥、隔离区）与 `wq-downstream`
+  （下游供数目录）持久化数据；如需让宿主机上的采集程序直接读取
+  `published_results.csv`，把 `wq-downstream` 改为绑定挂载宿主机目录即可；
+- 可用环境变量 `WQ_DATA_DIR` / `WQ_DOWNSTREAM_DIR` 覆盖容器内目录。
 
 ## 操作流程
 
@@ -89,9 +122,11 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 .venv/bin/python -I tests/selftest.py
 ```
 
-覆盖 42 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
+覆盖 72 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
 同版本双页面并发冲突（409 + obsolete + 重新预览成功）、文件缺失/损坏/临时文件/
-游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护。
+游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护，以及质控趋势的
+批次顺序/末版读数/同批修订只计一次/缺项中断/严格超限判定/旧批次重发重算/
+发布失败不改变判断/参数校验/读取失败不显示旧告警。
 
 `examples/` 下提供 `batch_v1.csv`、`batch_v2_revision.csv`（含增改删）与
 `batch_invalid.csv`（含重复、负数、空值）可直接在页面上演练。
@@ -99,9 +134,10 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 ## 部署提示与已知限制
 
 - `flask run` 为开发服务器；正式环境建议用 `waitress-serve --host 127.0.0.1
-  --port 5000 wsgi:create_app`（或 gunicorn 单实例多线程）。并发正确性依赖
-  SQLite 的 `BEGIN IMMEDIATE` 文件锁与同目录 `os.replace`，多 worker 部署时
-  必须共享同一个 `WQ_DATA_DIR` 与 `WQ_DOWNSTREAM_DIR`。
+  --port 5000 --call wsgi:create_app`（或 gunicorn 单实例多线程），亦可直接
+  使用仓库自带的 Docker Compose。并发正确性依赖 SQLite 的 `BEGIN IMMEDIATE`
+  文件锁与同目录 `os.replace`，多 worker 部署时必须共享同一个 `WQ_DATA_DIR`
+  与 `WQ_DOWNSTREAM_DIR`。
 - 全量结果按版本保留在 `results` 表中，当前未提供历史版本回滚的页面入口
   （数据具备，可后续增加）；历史 CSV 文件本身只保留最新一版。
 - 上传上限 16MB；认证、权限控制未包含在本版本内，建议仅监听内网或前置反向代理

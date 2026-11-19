@@ -251,6 +251,88 @@ class Storage:
                 "SELECT * FROM event_log ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
 
+    # ---------- 质控趋势 ----------
+    def qc_trend(self, sample_no: str, analyte: str,
+                 target: float, stddev: float) -> dict:
+        """质控样本趋势与连续偏高/偏低告警。
+
+        规则：批次按首次发布顺序排列，每批取其最后一次已发布版本中
+        (sample_no, analyte) 的读数（同批修订只计一次）；该批缺此读数时
+        连续段中断。相邻两批均严格高于 target+2σ 判连续偏高，均严格低于
+        target−2σ 判连续偏低，告警标出后一批及两批的依据版本。
+
+        一致性保证：全部读取在同一个显式读事务内完成，整个结果基于同一份
+        完整的已提交版本快照——并发发布不会混入半个新版本，发布失败
+        （事务回滚）的数据永不可见。每次调用都重新读取并实时计算，
+        不缓存任何旧告警；读取失败时异常直接抛给调用方，由页面决定
+        不渲染任何趋势结果。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")  # 显式读事务：固定本次查看的一致性快照
+            batches = conn.execute(
+                "SELECT batch_no, MIN(version) AS first_version,"
+                " MAX(version) AS last_version"
+                " FROM results GROUP BY batch_no"
+                " ORDER BY first_version, batch_no"
+            ).fetchall()
+            points: list[dict] = []
+            for b in batches:
+                row = conn.execute(
+                    "SELECT concentration FROM results"
+                    " WHERE version=? AND sample_no=? AND analyte=?",
+                    (b["last_version"], sample_no, analyte),
+                ).fetchone()
+                points.append(
+                    {
+                        "batch_no": b["batch_no"],
+                        "first_version": b["first_version"],
+                        "last_version": b["last_version"],
+                        "value": row["concentration"] if row else None,
+                    }
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        upper = target + 2.0 * stddev
+        lower = target - 2.0 * stddev
+        alerts: list[dict] = []
+        flagged: set[int] = set()
+        for i in range(1, len(points)):
+            prev, cur = points[i - 1], points[i]
+            if prev["value"] is None or cur["value"] is None:
+                continue  # 缺项中断连续段：跨缺项的相邻对不产生告警
+            if prev["value"] > upper and cur["value"] > upper:
+                direction = "high"
+            elif prev["value"] < lower and cur["value"] < lower:
+                direction = "low"
+            else:
+                continue
+            alerts.append({"direction": direction, "earlier": prev, "later": cur})
+            flagged.add(i)  # 标出后一批
+        for idx, p in enumerate(points):
+            value = p["value"]
+            if value is None:
+                p["status"] = "missing"
+            elif value > upper:
+                p["status"] = "high"
+            elif value < lower:
+                p["status"] = "low"
+            else:
+                p["status"] = "ok"
+            p["flagged"] = idx in flagged
+        return {
+            "sample_no": sample_no,
+            "analyte": analyte,
+            "target": target,
+            "stddev": stddev,
+            "upper": upper,
+            "lower": lower,
+            "points": points,
+            "alerts": alerts,
+        }
+
     def get_session(self, token: str):
         with self._connect() as conn:
             row = conn.execute(

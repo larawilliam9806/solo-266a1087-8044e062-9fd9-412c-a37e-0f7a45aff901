@@ -6,11 +6,15 @@
 3. 并发：两个页面从同一版本发起，仅一个发布成功，另一个 409 须重新预览
 4. 崩溃恢复：文件缺失、文件被改坏、遗留临时文件、游离文件、改名后未提交
 5. 撤回语义：整批替换后旧行消失；会话取消/重复发布防护
+6. 质控趋势：首次发布顺序、末版读数、同批修订只计一次、缺项中断、严格超限判定、
+   旧批次重发重算、发布失败不改变判断、参数校验、读取失败不显示旧告警
 """
 import hashlib
 import io
 import os
+import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -87,7 +91,6 @@ print("== 2. 首次发布 v1 ==")
 resp = upload(client, "batch_v1.csv", "BATCH-001")
 check("预览页 200 且显示增删改", resp.status_code == 200
       and "新增".encode() in resp.data and "撤回".encode() in resp.data)
-import re
 m = re.search(rb'/publish/([0-9a-f]+)', resp.data)
 check("预览页含发布令牌", m is not None)
 token1 = m.group(1).decode()
@@ -209,5 +212,156 @@ check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
 
 shutil.rmtree(tmp, ignore_errors=True)
+
+# ---------------- 7. 质控趋势页 ----------------
+print("== 7. 质控趋势：顺序、末版读数、缺项中断、严格判定 ==")
+trend_tmp = tempfile.mkdtemp(prefix="wq-trend-")
+tapp = create_app(data_dir=os.path.join(trend_tmp, "data"),
+                  downstream_dir=os.path.join(trend_tmp, "downstream"))
+tc = tapp.test_client()
+TREND_QS = "/trend?sample_no=QC1&analyte=氨氮&target=1.0&stddev=0.05"
+
+
+def preview_only(client_, batch_no, rows):
+    csv_text = "样本号,检测项目,浓度(mg/L)\n" + "".join(
+        f"{s},{a},{c}\n" for s, a, c in rows)
+    resp = client_.post("/preview", data={
+        "batch_no": batch_no,
+        "csv_file": (io.BytesIO(csv_text.encode("utf-8")), f"{batch_no}.csv"),
+    }, content_type="multipart/form-data")
+    assert resp.status_code == 200, resp.data[:300]
+    return re.search(rb"/publish/([0-9a-f]+)", resp.data).group(1).decode()
+
+
+def publish_rows(client_, batch_no, rows):
+    resp = client_.post(f"/publish/{preview_only(client_, batch_no, rows)}")
+    assert resp.status_code == 302, resp.data[:300]
+
+
+# 目标 1.0、σ 0.05 → 上限 1.10、下限 0.90
+plan = [
+    ("QA", [("QC1", "氨氮", 1.20), ("S1", "COD", 5.0)]),  # v1 高
+    ("QB", [("QC1", "氨氮", 1.30)]),                      # v2 高 → 告警 QB
+    ("QC", [("S2", "COD", 3.0)]),                         # v3 缺项 → 中断连续段
+    ("QD", [("QC1", "氨氮", 1.40)]),                      # v4 高（前批缺项，无告警）
+    ("QE", [("QC1", "氨氮", 1.50)]),                      # v5 高 → 告警 QE
+    ("QF", [("QC1", "氨氮", 0.80)]),                      # v6 低
+    ("QG", [("QC1", "氨氮", 0.70)]),                      # v7 低 → 告警 QG
+    ("QH", [("QC1", "氨氮", 1.10)]),                      # v8 恰等于上限，不算超限
+    ("QI", [("QC1", "氨氮", 1.25)]),                      # v9 高（前批未严格超限，无告警）
+]
+for _batch, _rows in plan:
+    publish_rows(tc, _batch, _rows)
+
+resp = tc.get(TREND_QS)
+check("趋势查询页 200", resp.status_code == 200)
+body = resp.data.decode()
+check("页面同时展示偏高与偏低告警", "连续偏高" in body and "连续偏低" in body)
+check("页面展示缺项与告警标记", "缺项" in body and body.count("告警批次") == 3,
+      f"告警批次×{body.count('告警批次')}")
+
+res = tapp.storage.qc_trend("QC1", "氨氮", 1.0, 0.05)
+check("9 个批次按首次发布顺序各计一次",
+      [p["batch_no"] for p in res["points"]]
+      == ["QA", "QB", "QC", "QD", "QE", "QF", "QG", "QH", "QI"])
+check("缺项批次读数为 None 且状态 missing",
+      res["points"][2]["value"] is None and res["points"][2]["status"] == "missing")
+check("恰等于上限不算超限（严格大于）", res["points"][7]["status"] == "ok")
+alerts = {(a["later"]["batch_no"], a["direction"],
+           a["earlier"]["last_version"], a["later"]["last_version"])
+          for a in res["alerts"]}
+check("告警为 QB/QE 偏高、QG 偏低，且两批依据版本正确（跨缺项无告警）",
+      alerts == {("QB", "high", 1, 2), ("QE", "high", 4, 5), ("QG", "low", 6, 7)},
+      str(alerts))
+
+print("== 8. 旧批次重发后告警重算、同批修订只计一次 ==")
+publish_rows(tc, "QA", [("QC1", "氨氮", 0.50)])  # v10：QA 末版读数变低
+res = tapp.storage.qc_trend("QC1", "氨氮", 1.0, 0.05)
+check("同批修订只计一次：仍 9 个批次点", len(res["points"]) == 9)
+qa = res["points"][0]
+check("QA 仍按首次发布顺序排第一，依据版本更新为 v10、读数 0.5",
+      qa["batch_no"] == "QA" and qa["first_version"] == 1
+      and qa["last_version"] == 10 and qa["value"] == 0.5)
+alerts2 = {(a["later"]["batch_no"], a["direction"]) for a in res["alerts"]}
+check("旧批次重发后告警重算：QB 告警消失，QE/QG 保留",
+      alerts2 == {("QE", "high"), ("QG", "low")}, str(alerts2))
+
+print("== 9. 发布失败不改变趋势判断 ==")
+tok_j = preview_only(tc, "QJ", [("QC1", "氨氮", 1.60)])
+tok_k = preview_only(tc, "QK", [("QC1", "氨氮", 1.70)])  # 与 QJ 同基线
+resp = tc.post(f"/publish/{tok_j}")
+check("QJ 发布成功 → v11", resp.status_code == 302
+      and tapp.storage.current_registry()["current_version"] == 11)
+before = tapp.storage.qc_trend("QC1", "氨氮", 1.0, 0.05)["alerts"]
+check("QI→QJ 连续偏高，新告警出现",
+      any(a["later"]["batch_no"] == "QJ" and a["direction"] == "high"
+          for a in before))
+resp = tc.post(f"/publish/{tok_k}")
+check("QK 发布失败（409 过期）", resp.status_code == 409)
+after = tapp.storage.qc_trend("QC1", "氨氮", 1.0, 0.05)["alerts"]
+check("发布失败不改变趋势判断",
+      [(a["direction"], a["earlier"]["batch_no"], a["later"]["batch_no"])
+       for a in after]
+      == [(a["direction"], a["earlier"]["batch_no"], a["later"]["batch_no"])
+          for a in before])
+
+print("== 10. 趋势参数校验 ==")
+resp = tc.get("/trend")
+check("未填参数时仅显示表单、不显示结果",
+      resp.status_code == 200 and "控制上限（".encode() not in resp.data)
+bad_cases = [
+    ("target=-1&stddev=0.05", "非负"),
+    ("target=abc&stddev=0.05", "不是合法数字"),
+    ("target=nan&stddev=0.05", "有限数"),
+    ("target=inf&stddev=0.05", "有限数"),
+    ("target=1.0&stddev=0", "正有限数"),
+    ("target=1.0&stddev=-0.5", "正有限数"),
+    ("target=1.0&stddev=inf", "有限数"),
+]
+for qs, msg in bad_cases:
+    resp = tc.get(f"/trend?sample_no=QC1&analyte=氨氮&{qs}")
+    check(f"非法参数 {qs} 被拒（{msg}）",
+          resp.status_code == 200 and msg.encode() in resp.data
+          and "控制上限（".encode() not in resp.data)
+resp = tc.get("/trend?sample_no=&analyte=氨氮&target=1.0&stddev=0.05")
+check("空质控样本号被拒", "质控样本号不能为空".encode() in resp.data)
+resp = tc.get("/trend?sample_no=QC1&analyte=&target=1.0&stddev=0.05")
+check("空检测项目被拒", "检测项目不能为空".encode() in resp.data)
+resp = tc.get("/trend?sample_no=QC1&analyte=氨氮&target=1.0&stddev=")
+check("空标准差被拒", "标准差不能为空".encode() in resp.data)
+resp = tc.get("/trend?sample_no=QC1&analyte=氨氮&target=0&stddev=0.05")
+check("目标浓度 0（非负边界）通过", resp.status_code == 200
+      and "控制上限（".encode() in resp.data)
+
+print("== 11. 读取失败不显示旧告警 ==")
+def _boom(*_a, **_k):
+    raise sqlite3.OperationalError("database is locked")
+
+orig_qc = tapp.storage.qc_trend
+tapp.storage.qc_trend = _boom
+resp = tc.get(TREND_QS)
+check("读取失败：提示错误且绝不渲染旧告警",
+      resp.status_code == 200
+      and "读取失败".encode() in resp.data
+      and "告警批次".encode() not in resp.data
+      and "控制上限（".encode() not in resp.data)
+tapp.storage.qc_trend = orig_qc
+resp = tc.get(TREND_QS)
+check("恢复后重新实时计算并显示告警", "告警批次".encode() in resp.data)
+
+print("== 12. 空库与无匹配读数 ==")
+empty_tmp = tempfile.mkdtemp(prefix="wq-trend-empty-")
+eapp = create_app(data_dir=os.path.join(empty_tmp, "data"),
+                  downstream_dir=os.path.join(empty_tmp, "downstream"))
+resp = eapp.test_client().get(TREND_QS)
+check("无任何发布时正常显示空趋势",
+      resp.status_code == 200 and "尚无已发布批次".encode() in resp.data)
+res_none = tapp.storage.qc_trend("NO-SUCH", "氨氮", 1.0, 0.05)
+check("无匹配读数时全部缺项且无告警",
+      all(p["value"] is None for p in res_none["points"])
+      and res_none["alerts"] == [])
+
+shutil.rmtree(trend_tmp, ignore_errors=True)
+shutil.rmtree(empty_tmp, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")
 sys.exit(1 if FAIL else 0)

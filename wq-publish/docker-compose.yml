@@ -1,0 +1,21 @@
+# docker compose 一键启动：docker compose up -d --build
+# 访问 http://127.0.0.1:5000 （批次发布）与 http://127.0.0.1:5000/trend （质控趋势）
+services:
+  wq-publish:
+    build: .
+    image: wq-publish:latest
+    ports:
+      - "5000:5000"
+    environment:
+      WQ_DATA_DIR: /app/data
+      WQ_DOWNSTREAM_DIR: /app/downstream
+    volumes:
+      # SQLite 登记库 / flask 密钥 / 隔离区：必须持久化，是版本登记的唯一真相源
+      - wq-data:/app/data
+      # 下游采集程序读取目录（published_results.csv 所在），可改为宿主机路径供采集程序挂载
+      - wq-downstream:/app/downstream
+    restart: unless-stopped
+
+volumes:
+  wq-data:
+  wq-downstream:
